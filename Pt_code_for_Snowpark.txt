@@ -1,0 +1,528 @@
+# Import required libraries
+from snowflake.snowpark import Session
+import logging
+import time
+from assets.config import session_config
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Snowflake session configuration
+
+# Define the session config directly here
+session_config_local = {
+    "account": "XXXXXXXXX.us-west-2",
+    "user": "XXXXXXXXX",
+    "role": "XXXXXXXXX",
+    "warehouse": "XXXXXXXXX",
+    "database": "XXXXXXXXX",
+    "schema": "XXXXXXXXX",
+    "password": "XXXXXXXXX",
+}
+
+# Step 1: Create Snowflake session
+session = Session.builder.configs(session_config).create()
+
+logging.info("Snowflake session created successfully.")
+
+
+# Create Database for Staging
+session.sql("""
+CREATE OR REPLACE DATABASE AGRICULTURE;
+""").collect()
+time.sleep(2)
+
+
+session.sql("""
+USE DATABASE AGRICULTURE;
+""").collect()
+
+time.sleep(2)
+
+# Create schema for Staging
+session.sql("""
+CREATE SCHEMA IF NOT EXISTS AGRICULTURE.STAGING;
+""").collect()
+
+time.sleep(3) 
+
+session.sql("""
+USE SCHEMA AGRICULTURE.STAGING;
+""").collect()
+
+
+
+# Create file format for CSV
+session.sql("""
+CREATE OR REPLACE FILE FORMAT AGRICULTURE.STAGING.csv_format
+    TYPE = CSV
+    FIELD_DELIMITER = ','
+    SKIP_HEADER = 1
+    NULL_IF = ('', 'NULL', 'null')
+    EMPTY_FIELD_AS_NULL = TRUE
+    TRIM_SPACE = TRUE;
+""").collect()
+
+
+time.sleep(6) 
+
+
+# Create external stage
+session.sql("""
+CREATE OR REPLACE STAGE AGRICULTURE.STAGING.ext_csv_stage
+    URL = 's3://agriculturebucket/upload_csv/'
+    STORAGE_INTEGRATION = s3_int
+    FILE_FORMAT = AGRICULTURE.STAGING.csv_format;
+""").collect()
+
+time.sleep(6) 
+
+# Create the staging table
+session.sql("""
+CREATE OR REPLACE TABLE AGRICULTURE.STAGING.agri_stage_tbl (
+    State STRING,
+    District STRING,
+    Crop STRING,
+    Year STRING,
+    Season STRING,
+    Area FLOAT,
+    Area_Units STRING,
+    Production FLOAT,
+    Production_Units STRING,
+    Yield FLOAT,
+    Fin_Year INT
+);
+""").collect()
+
+# Wait for 6 SEC before executing the next set of queries 
+logging.info("Stage table created noW I'm Waiting for 6 SEC before proceeding...")
+time.sleep(6)  # Wait for 6 sec (10 seconds)
+
+
+
+
+
+
+# Create stream for tracking changes
+session.sql("""
+CREATE or replace STREAM AGRICULTURE.STAGING.agri_stage_stream
+    ON TABLE AGRICULTURE.STAGING.agri_stage_tbl
+    SHOW_INITIAL_ROWS = TRUE;
+""").collect()
+
+# Wait for 20 SEC before executing the next set of queries FOR CONSUMING STREAM DML IN MY  INTERMEDIATE TABLE
+logging.info("Stream created no I'm Waiting for 10 SEC before proceeding...")
+time.sleep(15)  # Wait for 10 sec (10 seconds)
+
+# Create pipe for auto ingest
+session.sql("""
+CREATE OR REPLACE PIPE AGRICULTURE.STAGING.agri_pipe
+    AUTO_INGEST = TRUE
+    AS
+    COPY INTO AGRICULTURE.STAGING.agri_stage_tbl
+    FROM @AGRICULTURE.STAGING.ext_csv_stage
+    FILE_FORMAT = (FORMAT_NAME = AGRICULTURE.STAGING.csv_format)
+    ON_ERROR = CONTINUE;
+""").collect()
+
+# Wait for 20 SEC before executing the next set of queries FOR PIPE INGESTION
+logging.info(" pipe created now I'm Waiting for 10 SEC before proceeding...")
+time.sleep(10)  # Wait for 10 sec (10 seconds)
+
+
+
+
+
+# Refresh the pipe multiple times as per your request
+for _ in range(4):
+    session.sql("ALTER PIPE AGRICULTURE.STAGING.agri_pipe REFRESH;").collect()
+
+# Wait for 5 minute before executing the next set of queries
+logging.info("Waiting for 1 minute before proceeding...so pipe fills my stage table and meanwhile our stream also caputres DML ops ")
+time.sleep(60)  # Wait for 5 minute (300 seconds)
+
+# Fetch records from the staging table
+result = session.sql("SELECT * FROM AGRICULTURE.STAGING.agri_stage_tbl;").collect()
+logging.info(f"Fetched {len(result)} rows from staging table.")
+
+
+# Wait for 20 SEC before executing the next set of queries FOR CONSUMING STREAM DML IN MY  INTERMEDIATE TABLE
+logging.info("Data filled in stage table and stream recorded DML too now I'm Waiting for 10 SEC before proceeding...")
+time.sleep(10)  # Wait for 10 sec (10 seconds)
+
+
+
+
+
+# Create stream for tracking changes
+session.sql("""
+CREATE or replace STREAM AGRICULTURE.STAGING.agri_stage_stream
+    ON TABLE AGRICULTURE.STAGING.agri_stage_tbl
+    SHOW_INITIAL_ROWS = TRUE;
+""").collect()
+
+time.sleep(8)
+
+session.sql("SELECT * FROM AGRICULTURE.STAGING.agri_stage_stream;").collect()
+
+time.sleep(8)
+
+
+# Create  table from stream
+session.sql("""
+CREATE OR REPLACE TABLE AGRICULTURE.STAGING.temp_agri_stage_stream AS
+SELECT *
+FROM AGRICULTURE.STAGING.agri_stage_stream;
+
+""").collect()
+
+time.sleep(8)
+
+resultb = session.sql("SELECT * FROM AGRICULTURE.STAGING.temp_agri_stage_stream;").collect()
+logging.info(f"Fetched {len(resultb)} rows from intermediate table.")
+
+
+# Wait for 20 SEC before executing the next set of queries FOR CONSUMING STREAM DML IN MY  INTERMEDIATE TABLE
+logging.info(" created intermediate table and filled it with stream recordings")
+time.sleep(20)  # Wait for 20 sec  (20 seconds)
+
+
+
+
+# Create dimensions schema
+session.sql("""
+CREATE SCHEMA IF NOT EXISTS AGRICULTURE.DIMENSIONS;
+""").collect()
+
+
+time.sleep(6) 
+
+
+
+# Create task for dimension tables
+session.sql("""
+CREATE OR REPLACE TASK AGRICULTURE.DIMENSIONS.create_tables_task
+WAREHOUSE = 'COMPUTE_WH'
+SCHEDULE = 'USING CRON * * * * * Asia/Kolkata'
+AS
+BEGIN
+    CREATE OR REPLACE TABLE AGRICULTURE.DIMENSIONS.state_dim (
+        state_id INT AUTOINCREMENT,
+        state_name STRING,
+        PRIMARY KEY(state_id)
+    );
+    CREATE OR REPLACE TABLE AGRICULTURE.DIMENSIONS.district_dim (
+        district_id INT AUTOINCREMENT,
+        district_name STRING,
+        state_id INT,
+        PRIMARY KEY(district_id),
+        FOREIGN KEY(state_id) REFERENCES AGRICULTURE.DIMENSIONS.state_dim(state_id)
+    );
+    CREATE OR REPLACE TABLE AGRICULTURE.DIMENSIONS.crop_dim (
+        crop_id INT AUTOINCREMENT,
+        crop_name STRING,
+        PRIMARY KEY(crop_id)
+    );
+    CREATE OR REPLACE TABLE AGRICULTURE.DIMENSIONS.season_dim (
+        season_id INT AUTOINCREMENT,
+        season_name STRING,
+        PRIMARY KEY(season_id)
+    );
+    CREATE OR REPLACE TABLE AGRICULTURE.DIMENSIONS.year_dim (
+        year_id INT AUTOINCREMENT,
+        fin_year STRING,
+        Years STRING,
+        PRIMARY KEY(year_id)
+    );
+END;
+""").collect()
+
+time.sleep(6) 
+
+
+# Execute the task to create dimension tables
+session.sql("EXECUTE TASK AGRICULTURE.DIMENSIONS.create_tables_task;").collect()
+time.sleep(5)
+session.sql("ALTER TASK AGRICULTURE.DIMENSIONS.create_tables_task RESUME;").collect()
+time.sleep(5)
+
+# Wait for 1 minute before executing the next set of queries
+logging.info("Waiting for 1 minutes before proceeding... SO OUR TASK OF DIMENSION TABLE CREATION GETS COMPLETED")
+time.sleep(60)  # Wait for 1 minute (60 seconds)
+
+# Task for populating tables
+session.sql("""
+CREATE OR REPLACE TASK AGRICULTURE.DIMENSIONS.populate_tables_task
+WAREHOUSE = 'COMPUTE_WH'
+SCHEDULE = 'USING CRON * * * * * Asia/Kolkata'
+AS
+BEGIN
+    -- Populate state_dim
+    INSERT INTO AGRICULTURE.DIMENSIONS.state_dim (state_name)
+    SELECT DISTINCT State
+    FROM AGRICULTURE.STAGING.temp_agri_stage_stream
+    WHERE State NOT IN (
+        SELECT state_name 
+        FROM AGRICULTURE.DIMENSIONS.state_dim
+    );
+
+    -- Populate district_dim
+    INSERT INTO AGRICULTURE.DIMENSIONS.district_dim (district_name, state_id)
+    SELECT DISTINCT
+        temp_agri_stage_stream.District,
+        state_dim.state_id
+    FROM AGRICULTURE.STAGING.temp_agri_stage_stream
+    JOIN AGRICULTURE.DIMENSIONS.state_dim
+        ON temp_agri_stage_stream.State = state_dim.state_name
+    WHERE District NOT IN (
+        SELECT district_name 
+        FROM AGRICULTURE.DIMENSIONS.district_dim
+    );
+
+    -- Populate crop_dim
+    INSERT INTO AGRICULTURE.DIMENSIONS.crop_dim (crop_name)
+    SELECT DISTINCT Crop
+    FROM AGRICULTURE.STAGING.temp_agri_stage_stream
+    WHERE Crop NOT IN (
+        SELECT crop_name 
+        FROM AGRICULTURE.DIMENSIONS.crop_dim
+    );
+
+    -- Populate season_dim
+    INSERT INTO AGRICULTURE.DIMENSIONS.season_dim (season_name)
+    SELECT DISTINCT Season
+    FROM AGRICULTURE.STAGING.temp_agri_stage_stream
+    WHERE Season NOT IN (
+        SELECT season_name 
+        FROM AGRICULTURE.DIMENSIONS.season_dim
+    );
+
+    -- Populate year_dim
+    INSERT INTO AGRICULTURE.DIMENSIONS.year_dim (fin_year, Years)
+    SELECT DISTINCT
+        temp_agri_stage_stream.Fin_Year,
+        SPLIT_PART(temp_agri_stage_stream.Fin_Year, '-', 1)
+    FROM AGRICULTURE.STAGING.temp_agri_stage_stream
+    WHERE Fin_Year NOT IN (
+        SELECT fin_year 
+        FROM AGRICULTURE.DIMENSIONS.year_dim
+    );
+    
+END;
+
+""").collect()
+
+
+
+time.sleep(6)
+
+
+
+
+# Execute the task to populate tables
+#session.sql("EXECUTE TASK AGRICULTURE.DIMENSIONS.populate_tables_task;").collect()
+time.sleep(5)
+#session.sql("ALTER TASK AGRICULTURE.DIMENSIONS.populate_tables_task RESUME;").collect()
+time.sleep(5)
+
+
+
+# Wait for 10 minute before executing the next set of queries
+logging.info("Waiting for 2 minuteS before proceeding...SO  DIM TBL GETS POPULATED")
+time.sleep(30)  # Wait for 2 minute (240 seconds)
+
+# Create fact table
+session.sql("""
+CREATE OR REPLACE TABLE AGRICULTURE.DIMENSIONS.agri_fact (
+    fact_id INT AUTOINCREMENT,
+    state_id INT,
+    district_id INT,
+    crop_id INT,
+    season_id INT,
+    year_id INT,
+    area FLOAT,
+    area_units STRING,
+    production FLOAT,
+    production_units STRING,
+    yield FLOAT,
+    PRIMARY KEY(fact_id),
+    FOREIGN KEY(state_id) REFERENCES AGRICULTURE.DIMENSIONS.state_dim(state_id),
+    FOREIGN KEY(district_id) REFERENCES AGRICULTURE.DIMENSIONS.district_dim(district_id),
+    FOREIGN KEY(crop_id) REFERENCES AGRICULTURE.DIMENSIONS.crop_dim(crop_id),
+    FOREIGN KEY(season_id) REFERENCES AGRICULTURE.DIMENSIONS.season_dim(season_id),
+    FOREIGN KEY(year_id) REFERENCES AGRICULTURE.DIMENSIONS.year_dim(year_id)
+);
+""").collect()
+
+
+
+time.sleep(6)
+
+
+
+# Populate the fact table
+session.sql("""
+CREATE OR REPLACE TASK AGRICULTURE.DIMENSIONS.populate_fact_table_task
+WAREHOUSE = 'COMPUTE_WH'
+SCHEDULE = 'USING CRON * * * * * Asia/Kolkata'
+AS
+BEGIN
+    -- Merge data into fact table
+    MERGE INTO AGRICULTURE.DIMENSIONS.agri_fact AS target
+    USING (
+        SELECT 
+            state_dim.state_id,
+            district_dim.district_id,
+            crop_dim.crop_id,
+            season_dim.season_id,
+            year_dim.year_id,
+            temp_agri_stage_stream.Area,
+            temp_agri_stage_stream.Area_Units,
+            temp_agri_stage_stream.Production,
+            temp_agri_stage_stream.Production_Units,
+            temp_agri_stage_stream.Yield
+        FROM AGRICULTURE.STAGING.temp_agri_stage_stream
+        JOIN AGRICULTURE.DIMENSIONS.state_dim 
+            ON temp_agri_stage_stream.State = state_dim.state_name
+        JOIN AGRICULTURE.DIMENSIONS.district_dim 
+            ON temp_agri_stage_stream.District = district_dim.district_name
+        JOIN AGRICULTURE.DIMENSIONS.crop_dim 
+            ON temp_agri_stage_stream.Crop = crop_dim.crop_name
+        JOIN AGRICULTURE.DIMENSIONS.season_dim 
+            ON temp_agri_stage_stream.Season = season_dim.season_name
+        JOIN AGRICULTURE.DIMENSIONS.year_dim 
+            ON temp_agri_stage_stream.Fin_Year = year_dim.fin_year
+    ) AS source
+    ON target.state_id = source.state_id
+       AND target.district_id = source.district_id
+       AND target.crop_id = source.crop_id
+       AND target.season_id = source.season_id
+       AND target.year_id = source.year_id
+    WHEN MATCHED THEN
+        UPDATE SET 
+            target.area = source.area,
+            target.area_units = source.area_units,
+            target.production = source.production,
+            target.production_units = source.production_units,
+            target.yield = source.yield
+    WHEN NOT MATCHED THEN
+        INSERT (
+            state_id, district_id, crop_id, season_id, year_id, 
+            area, area_units, production, production_units, yield
+        )
+        VALUES (
+            source.state_id, source.district_id, source.crop_id, 
+            source.season_id, source.year_id, 
+            source.area, source.area_units, source.production, 
+            source.production_units, source.yield
+        );
+END;
+""").collect()
+
+
+time.sleep(6)
+
+# Execute the fact table population task
+#session.sql("EXECUTE TASK AGRICULTURE.DIMENSIONS.populate_fact_table_task;").collect()
+time.sleep(5)
+#session.sql("ALTER TASK AGRICULTURE.DIMENSIONS.populate_fact_table_task RESUME;").collect()
+time.sleep(5)
+
+
+# Wait for 5 MINUTE 
+logging.info(" WAITING FOR 2 MINUTE SO FACT TABLE GETS POPULATED BY OUR FACT TABLE POPULATING TASK")
+time.sleep(30)  # Wait for 2 MINUTES
+
+
+
+#########################################################################################################################
+
+
+
+
+
+logging.info(" Please wait for  15 MINUTE to reprocess everything...................")
+time.sleep(5)  
+
+# Fetch records from the staging table
+resultc = session.sql("SELECT * FROM AGRICULTURE.STAGING.temp_agri_stage_stream;").collect()
+time.sleep(5)
+logging.info(f"Fetched {len(resultc)} rows from stream as its already consumed.")   #1)watch stream again
+
+time.sleep(10)  # Wait for 10 seconds 
+
+
+
+
+
+
+
+''''
+#2) now make intermediate table and fill it with stream data
+session.sql("""
+CREATE OR REPLACE TABLE AGRICULTURE.STAGING.temp_agri_stage_stream AS
+SELECT *
+FROM AGRICULTURE.STAGING.agri_stage_stream;
+
+""").collect()
+
+
+
+time.sleep(20)  # Wait for 20 secs
+
+
+session.sql("SELECT * FROM AGRICULTURE.STAGING.temp_agri_stage_stream;").collect()
+
+'''
+
+
+# Fetch records from the staging table
+resultd = session.sql("SELECT * FROM AGRICULTURE.STAGING.temp_agri_stage_stream;").collect()
+time.sleep(5)
+logging.info(f"Fetched {len(resultd)} rows from intermediate table.")
+
+
+
+time.sleep(20)  # Wait for 20 secs 
+
+
+
+#3)  now I'll run poplate dim table task again as i got data in my intermediate table
+# Execute the task to populate tables
+
+logging.info(" Please wait for  20 MINUTE to reprocess TASKS...................")
+time.sleep(5) 
+session.sql("EXECUTE TASK AGRICULTURE.DIMENSIONS.populate_tables_task;").collect()
+time.sleep(240)
+#session.sql("ALTER TASK AGRICULTURE.DIMENSIONS.populate_tables_task RESUME;").collect()
+#time.sleep(5)
+
+logging.info(" WPlease wait for 10 MINUTES more for reprocessing dim tables..........")
+time.sleep(500)  # Wait for 10 MINUTE 
+
+
+
+
+#4) now I'll run fact table population task again as i got data in my intermediate table
+# Execute the fact table population task
+session.sql("EXECUTE TASK AGRICULTURE.DIMENSIONS.populate_fact_table_task;").collect()
+time.sleep(500)
+#session.sql("ALTER TASK AGRICULTURE.DIMENSIONS.populate_fact_table_task RESUME;").collect()
+#time.sleep(5)
+
+
+logging.info(" Please wait for 5 MINUTES reprocessing fact table............")
+time.sleep(300)  # Wait for 5 MINUTE 
+
+
+''''''
+
+# Fetch records from the staging table
+#resultc = session.sql("SELECT * FROM AGRICULTURE.DIMENSIONS.agri_fact;").collect()
+#time.sleep(5)
+#logging.info(f"Fetched {len(resultc)} rows from stream.")   #1)watch stream again
+
+
+
+
+logging.info("Process completed successfully.")

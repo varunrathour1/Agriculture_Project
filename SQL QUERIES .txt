@@ -1,0 +1,476 @@
+drop database agriculture;
+
+drop database agriculture;
+
+CREATE OR REPLACE DATABASE AGRICULTURE;
+USE DATABASE AGRICULTURE;
+CREATE OR REPLACE SCHEMA STAGING;
+USE SCHEMA STAGING;
+
+
+ 
+
+
+
+
+
+
+
+
+-- Create integration object for external stage
+CREATE OR REPLACE STORAGE INTEGRATION s3_int
+  TYPE = external_stage
+  STORAGE_PROVIDER = s3
+  ENABLED = true
+  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::022499005779:role/snowflake_role'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://agriculturebucket/', 's3://agriculturebucket/upload_csv/');
+
+-- Describe integration object to fetch external_id and use in S3
+DESC INTEGRATION s3_int;
+
+
+
+
+
+
+
+CREATE OR REPLACE DATABASE AGRICULTURE;
+USE DATABASE AGRICULTURE;
+CREATE OR REPLACE SCHEMA STAGING;
+USE SCHEMA STAGING;
+
+
+ 
+
+
+
+CREATE SCHEMA IF NOT EXISTS AGRICULTURE.STAGING;
+
+CREATE OR REPLACE FILE FORMAT AGRICULTURE.STAGING.csv_format
+    TYPE = CSV
+    FIELD_DELIMITER = ','
+    SKIP_HEADER = 1
+    NULL_IF = ('', 'NULL', 'null')
+    EMPTY_FIELD_AS_NULL = TRUE
+    TRIM_SPACE = TRUE;
+	
+	
+	
+	
+	
+	CREATE OR REPLACE STAGE AGRICULTURE.STAGING.ext_csv_stage
+    URL = 's3://agriculturebucket/upload_csv/'
+    STORAGE_INTEGRATION = s3_int
+    FILE_FORMAT = AGRICULTURE.STAGING.csv_format;
+
+
+
+
+CREATE OR REPLACE TABLE AGRICULTURE.STAGING.agri_stage_tbl (
+        State STRING,
+        District STRING,
+        Crop STRING,
+        Year STRING,
+        Season STRING,
+        Area FLOAT,
+        Area_Units STRING,
+        Production FLOAT,
+        Production_Units STRING,
+        Yield FLOAT,
+        Fin_Year INT
+    );
+	
+	CREATE or replace STREAM AGRICULTURE.STAGING.agri_stage_stream
+    ON TABLE AGRICULTURE.STAGING.agri_stage_tbl
+    SHOW_INITIAL_ROWS = TRUE;
+	
+	
+	
+	CREATE OR REPLACE PIPE AGRICULTURE.STAGING.agri_pipe
+    AUTO_INGEST = TRUE
+    AS
+    COPY INTO AGRICULTURE.STAGING.agri_stage_tbl
+    FROM @AGRICULTURE.STAGING.ext_csv_stage
+    FILE_FORMAT = (FORMAT_NAME = AGRICULTURE.STAGING.csv_format)
+    ON_ERROR = CONTINUE;
+
+
+
+    show pipes;   -- to get my event ARN which I'll enter in my aws bucket to create event notification
+
+    ALTER PIPE AGRICULTURE.STAGING.agri_pipe REFRESH;  --To refresh pipe
+	
+
+    
+   
+
+    --HERE AFTER THIS QUERY I WANT TO WAIT FOR 1 MINUTE TO RUN NEXT QUERY   As ipe  wall take some time to filll my table 
+	
+	SELECT * FROM AGRICULTURE.STAGING.agri_stage_tbl;
+
+
+
+    
+
+
+
+
+
+
+CREATE OR REPLACE STREAM AGRICULTURE.STAGING.agri_stage_stream
+    ON TABLE AGRICULTURE.STAGING.agri_stage_tbl
+    SHOW_INITIAL_ROWS = TRUE;
+	
+
+SELECT * FROM AGRICULTURE.STAGING.agri_stage_stream;
+   
+
+
+
+
+--INTERMEDIATE TABLE TO CONSUME DML RECORDED BY MY STREAM 
+CREATE OR REPLACE TABLE AGRICULTURE.STAGING.temp_agri_stage_stream AS
+SELECT *
+FROM AGRICULTURE.STAGING.agri_stage_stream;
+
+  
+  SELECT * FROM  AGRICULTURE.STAGING.temp_agri_stage_stream
+  
+  
+
+   
+
+CREATE SCHEMA IF NOT EXISTS AGRICULTURE.DIMENSIONS;
+
+
+--Step 1: Task to Create dimesnion and fact Tables
+
+
+CREATE OR REPLACE TASK AGRICULTURE.DIMENSIONS.create_tables_task
+WAREHOUSE = 'COMPUTE_WH'
+SCHEDULE = 'USING CRON * * * * * Asia/Kolkata'
+AS
+BEGIN
+    -- Create Dimension Tables
+    CREATE OR REPLACE TABLE AGRICULTURE.DIMENSIONS.state_dim (
+        state_id INT AUTOINCREMENT,
+        state_name STRING,
+        PRIMARY KEY(state_id)
+    );
+
+    CREATE OR REPLACE TABLE AGRICULTURE.DIMENSIONS.district_dim (
+        district_id INT AUTOINCREMENT,
+        district_name STRING,
+        state_id INT,
+        PRIMARY KEY(district_id),
+        FOREIGN KEY(state_id) REFERENCES AGRICULTURE.DIMENSIONS.state_dim(state_id)
+    );
+
+    CREATE OR REPLACE TABLE AGRICULTURE.DIMENSIONS.crop_dim (
+        crop_id INT AUTOINCREMENT,
+        crop_name STRING,
+        PRIMARY KEY(crop_id)
+    );
+
+    CREATE OR REPLACE TABLE AGRICULTURE.DIMENSIONS.season_dim (
+        season_id INT AUTOINCREMENT,
+        season_name STRING,
+        PRIMARY KEY(season_id)
+    );
+
+    CREATE OR REPLACE TABLE AGRICULTURE.DIMENSIONS.year_dim (
+    year_id INT AUTOINCREMENT,
+    fin_year STRING,  -- Use STRING here to store '2001-02' format
+    Years STRING,     -- Change to STRING to handle both year ranges and single year values
+    PRIMARY KEY(year_id)
+     );
+
+
+    
+END;
+
+
+
+EXECUTE TASK AGRICULTURE.DIMENSIONS.create_tables_task;
+
+
+
+--Step 2: Task to Populate dimension and fact Tables  using stream
+
+
+
+
+-- Create Task to Populate Dim Table from Stream
+CREATE OR REPLACE TASK AGRICULTURE.DIMENSIONS.populate_dim_table_task
+WAREHOUSE = 'COMPUTE_WH'
+SCHEDULE = 'USING CRON * * * * * Asia/Kolkata'
+AS
+BEGIN
+    -- Populate state_dim
+    INSERT INTO AGRICULTURE.DIMENSIONS.state_dim (state_name)
+    SELECT DISTINCT State
+    FROM AGRICULTURE.STAGING.temp_agri_stage_stream
+    WHERE State NOT IN (
+        SELECT state_name 
+        FROM AGRICULTURE.DIMENSIONS.state_dim
+    );
+
+    -- Populate district_dim
+    INSERT INTO AGRICULTURE.DIMENSIONS.district_dim (district_name, state_id)
+    SELECT DISTINCT
+        temp_agri_stage_stream.District,
+        state_dim.state_id
+    FROM AGRICULTURE.STAGING.temp_agri_stage_stream
+    JOIN AGRICULTURE.DIMENSIONS.state_dim
+        ON temp_agri_stage_stream.State = state_dim.state_name
+    WHERE District NOT IN (
+        SELECT district_name 
+        FROM AGRICULTURE.DIMENSIONS.district_dim
+    );
+
+    -- Populate crop_dim
+    INSERT INTO AGRICULTURE.DIMENSIONS.crop_dim (crop_name)
+    SELECT DISTINCT Crop
+    FROM AGRICULTURE.STAGING.temp_agri_stage_stream
+    WHERE Crop NOT IN (
+        SELECT crop_name 
+        FROM AGRICULTURE.DIMENSIONS.crop_dim
+    );
+
+    -- Populate season_dim
+    INSERT INTO AGRICULTURE.DIMENSIONS.season_dim (season_name)
+    SELECT DISTINCT Season
+    FROM AGRICULTURE.STAGING.temp_agri_stage_stream
+    WHERE Season NOT IN (
+        SELECT season_name 
+        FROM AGRICULTURE.DIMENSIONS.season_dim
+    );
+
+    -- Populate year_dim
+    INSERT INTO AGRICULTURE.DIMENSIONS.year_dim (fin_year, Years)
+    SELECT DISTINCT
+        temp_agri_stage_stream.Fin_Year,
+        SPLIT_PART(temp_agri_stage_stream.Fin_Year, '-', 1)
+    FROM AGRICULTURE.STAGING.temp_agri_stage_stream
+    WHERE Fin_Year NOT IN (
+        SELECT fin_year 
+        FROM AGRICULTURE.DIMENSIONS.year_dim
+    );
+END;
+
+-- Execute Task
+EXECUTE TASK AGRICULTURE.DIMENSIONS.populate_dim_table_task;
+
+ALTER TASK AGRICULTURE.DIMENSIONS.populate_dim_table_task RESUME;
+
+
+--TOOK  4 minutes
+
+
+
+
+
+
+EXECUTE TASK AGRICULTURE.DIMENSIONS.populate_tables_task;
+
+
+
+
+
+
+                                       --NOW lets create our Fact table
+
+
+CREATE OR REPLACE TABLE AGRICULTURE.DIMENSIONS.agri_fact (
+    fact_id INT AUTOINCREMENT,
+    state_id INT,
+    district_id INT,
+    crop_id INT,
+    season_id INT,
+    year_id INT,
+    area FLOAT,
+    area_units STRING,
+    production FLOAT,
+    production_units STRING,
+    yield FLOAT,
+    PRIMARY KEY(fact_id),
+    FOREIGN KEY(state_id) REFERENCES AGRICULTURE.DIMENSIONS.state_dim(state_id),
+    FOREIGN KEY(district_id) REFERENCES AGRICULTURE.DIMENSIONS.district_dim(district_id),
+    FOREIGN KEY(crop_id) REFERENCES AGRICULTURE.DIMENSIONS.crop_dim(crop_id),
+    FOREIGN KEY(season_id) REFERENCES AGRICULTURE.DIMENSIONS.season_dim(season_id),
+    FOREIGN KEY(year_id) REFERENCES AGRICULTURE.DIMENSIONS.year_dim(year_id)
+);
+
+
+
+
+
+                                           --Lets use task and SQL's  MERGE INTO power to populate our fact table 
+
+CREATE OR REPLACE TASK AGRICULTURE.DIMENSIONS.populate_fact_table_task
+WAREHOUSE = 'COMPUTE_WH'
+SCHEDULE = 'USING CRON * * * * * Asia/Kolkata'
+AS
+BEGIN
+    -- Merge data into fact table
+    MERGE INTO AGRICULTURE.DIMENSIONS.agri_fact AS target
+    USING (
+        SELECT 
+            state_dim.state_id,
+            district_dim.district_id,
+            crop_dim.crop_id,
+            season_dim.season_id,
+            year_dim.year_id,
+            temp_agri_stage_stream.Area,
+            temp_agri_stage_stream.Area_Units,
+            temp_agri_stage_stream.Production,
+            temp_agri_stage_stream.Production_Units,
+            temp_agri_stage_stream.Yield
+        FROM AGRICULTURE.STAGING.temp_agri_stage_stream
+        JOIN AGRICULTURE.DIMENSIONS.state_dim 
+            ON temp_agri_stage_stream.State = state_dim.state_name
+        JOIN AGRICULTURE.DIMENSIONS.district_dim 
+            ON temp_agri_stage_stream.District = district_dim.district_name
+        JOIN AGRICULTURE.DIMENSIONS.crop_dim 
+            ON temp_agri_stage_stream.Crop = crop_dim.crop_name
+        JOIN AGRICULTURE.DIMENSIONS.season_dim 
+            ON temp_agri_stage_stream.Season = season_dim.season_name
+        JOIN AGRICULTURE.DIMENSIONS.year_dim 
+            ON temp_agri_stage_stream.Fin_Year = year_dim.fin_year
+    ) AS source
+    ON target.state_id = source.state_id
+       AND target.district_id = source.district_id
+       AND target.crop_id = source.crop_id
+       AND target.season_id = source.season_id
+       AND target.year_id = source.year_id
+    WHEN MATCHED THEN
+        UPDATE SET 
+            target.area = source.area,
+            target.area_units = source.area_units,
+            target.production = source.production,
+            target.production_units = source.production_units,
+            target.yield = source.yield
+    WHEN NOT MATCHED THEN
+        INSERT (
+            state_id, district_id, crop_id, season_id, year_id, 
+            area, area_units, production, production_units, yield
+        )
+        VALUES (
+            source.state_id, source.district_id, source.crop_id, 
+            source.season_id, source.year_id, 
+            source.area, source.area_units, source.production, 
+            source.production_units, source.yield
+        );
+END;
+
+
+
+
+EXECUTE TASK AGRICULTURE.DIMENSIONS.populate_fact_table_task
+
+ALTER TASK AGRICULTURE.DIMENSIONS.populate_fact_table_task RESUME;
+
+
+
+--TOOK AROUND 1 MINUTE ONLY
+
+SELECT * FROM  AGRICULTURE.DIMENSIONS.AGRI_FACT;
+
+
+
+
+
+                                                             --KPI WORK 
+
+
+
+
+SELECT 
+    d.district_name,
+    s.state_name,
+    (SUM(f.production) / SUM(f.area)) AS yield_efficiency
+FROM 
+    AGRICULTURE.DIMENSIONS.agri_fact f
+JOIN 
+    AGRICULTURE.DIMENSIONS.district_dim d ON f.district_id = d.district_id
+JOIN 
+    AGRICULTURE.DIMENSIONS.state_dim s ON d.state_id = s.state_id
+GROUP BY 
+    d.district_name, s.state_name
+ORDER BY 
+    yield_efficiency DESC
+LIMIT 5;
+
+
+
+
+
+
+
+
+
+    
+
+
+SELECT 
+    s.season_name,
+    SUM(f.production) AS total_production
+FROM 
+    AGRICULTURE.DIMENSIONS.agri_fact f
+JOIN 
+    AGRICULTURE.DIMENSIONS.season_dim s ON f.season_id = s.season_id
+GROUP BY 
+    s.season_name
+ORDER BY 
+    total_production DESC
+
+
+
+SELECT 
+    d.district_name,
+    s.state_name,
+    (SUM(f.production) / SUM(f.area)) AS arecanut_productivity
+FROM 
+    AGRICULTURE.DIMENSIONS.agri_fact f
+JOIN 
+    AGRICULTURE.DIMENSIONS.crop_dim c ON f.crop_id = c.crop_id
+JOIN 
+    AGRICULTURE.DIMENSIONS.district_dim d ON f.district_id = d.district_id
+JOIN 
+    AGRICULTURE.DIMENSIONS.state_dim s ON d.state_id = s.state_id
+WHERE 
+    c.crop_name = 'Arecanut'
+GROUP BY 
+    d.district_name, s.state_name
+ORDER BY 
+    arecanut_productivity DESC;
+
+
+
+SELECT 
+    s.state_name,
+    d.district_name,
+    (SUM(f.area) / SUM(total_area.total_area)) * 100 AS area_utilization_efficiency
+FROM 
+    AGRICULTURE.DIMENSIONS.agri_fact f
+JOIN 
+    AGRICULTURE.DIMENSIONS.district_dim d ON f.district_id = d.district_id
+JOIN 
+    AGRICULTURE.DIMENSIONS.state_dim s ON d.state_id = s.state_id
+JOIN 
+    (SELECT 
+        SUM(area) AS total_area
+     FROM AGRICULTURE.DIMENSIONS.agri_fact) total_area
+GROUP BY 
+    s.state_name, d.district_name
+ORDER BY 
+    area_utilization_efficiency DESC;
+
+
+
+
+
+
+
+
+
