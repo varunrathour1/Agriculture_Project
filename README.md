@@ -166,4 +166,5 @@ Data Source: Kaggle (Uploaded by Ajaypal Singh, Punjab University)
 
 For more details, refer to the project documentation or contact the contributor.
 
-Varun Rathourvarunrathour1@gmail.com
+Varun Rathour
+varunrathour1@gmail.com
